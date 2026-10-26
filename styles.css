@@ -62,8 +62,10 @@ input:focus, select:focus, textarea:focus {
   max-width: 760px; margin: 0 auto;
   padding: 12px 14px 2px;
   font-family: "Dancing Script", Georgia, serif;
-  font-size: 1.35rem; font-weight: 700;
-  color: var(--mahogany-dark);
+  font-size: 1.5rem; font-weight: 700;
+  color: var(--cream);
+  /* Your name glows warm like the lights, so it reads off the wall. */
+  text-shadow: 0 0 8px rgba(255, 200, 120, 0.9), 0 0 18px rgba(255, 170, 80, 0.55), 0 1px 3px rgba(0,0,0,0.45);
 }
 
 .setup-banner {
@@ -221,7 +223,8 @@ main {
 }
 .book .book-title {
   display: block; margin-top: 5px;
-  font-size: 0.74rem; line-height: 1.2; color: var(--ink);
+  font-size: 0.74rem; line-height: 1.2; color: var(--cream);
+  text-shadow: 0 1px 3px rgba(0,0,0,0.45);
   max-height: 2.4em; overflow: hidden;
 }
 .book .book-stars {
@@ -431,7 +434,7 @@ main {
 /* Page content sits above the painted wall, never under it. */
 .page.active > * { position: relative; z-index: 1; }
 #setupBanner { position: relative; z-index: 1; }
-#page-home.active::before { background-image: url('home-wall-pink-v5.webp'); }
+#page-home.active::before { background-image: url('home-wall-pink-v7-hearts.webp'); }
 #page-goal.active::before { background-image: url('goal-wall.webp'); }
 #page-jar.active::before { background-image: url('jar-wall.webp'); }
 #page-log.active::before { background-image: url('log-wall.webp'); }
@@ -458,5 +461,8 @@ main {
 .shelf-books {
   display: flex; align-items: flex-end; gap: 12px;
   padding: 18px 12px 0;
+  /* Soft dark shade behind each row so the books read clearly off the wall. */
+  background: linear-gradient(180deg, rgba(30,8,12,0.20), rgba(30,8,12,0.06));
+  border-radius: 16px;
 }
 .shelf-unit .shelf-plank { margin-bottom: 0; }
