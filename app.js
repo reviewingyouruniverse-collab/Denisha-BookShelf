@@ -1,0 +1,1329 @@
+/* My Bookshelf — standalone app.
+ * Data lives in Supabase when config.js is filled in, otherwise on this
+ * device only (localStorage) with a yellow "Not connected yet" note.
+ * Book catalogue: Open Library (openlibrary.org), free and public.
+ */
+(function () {
+  "use strict";
+
+  var BUILTIN_MOODS = ["adult vampire fantasy", "cozy", "dark", "romantasy", "spicy", "dark fantasy", "feel-good", "mystery"];
+  var SPINE_COLORS = ["#b3576e", "#7a8a5a", "#4a7a8a", "#c9a227", "#8a5a9e", "#d97a4a", "#5a8a7a", "#a34a5a"];
+
+  var state = {
+    books: [],
+    sessions: [],
+    goal: 0,
+    customMoods: [],
+    homeShelf: "tbr",
+    page: "home",
+    jarMode: "shelf", // "shelf" | "suggest"
+    pickedMoods: [],
+    pickedCategories: [],
+    visibleCategories: [],
+    surprise: false,
+    shownSuggestions: {},
+    currentModalBookId: null,
+    currentPreview: null
+  };
+
+  /* ---------------- setup: Supabase or on-device mode ---------------- */
+
+  var cfg = (window.MY_BOOKSHELF_CONFIG || {});
+  var connected = !!(cfg.supabaseUrl && cfg.supabaseAnonKey);
+  var supabase = null;
+  if (connected && window.supabase) {
+    try { supabase = window.supabase.createClient(cfg.supabaseUrl, cfg.supabaseAnonKey); }
+    catch (e) { connected = false; }
+  }
+  if (!connected) {
+    document.getElementById("setupBanner").classList.remove("hidden");
+  }
+
+  function uid() {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    return "id-" + Date.now() + "-" + Math.floor(Math.random() * 1000000);
+  }
+  function yearNow() { return new Date().getFullYear(); }
+  function todayStr() {
+    var d = new Date();
+    return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+  }
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+  function normKey(title, author) {
+    return (title || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim() + "|" + (author || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  }
+  function coverUrl(coverId, size) {
+    return coverId ? "https://covers.openlibrary.org/b/id/" + coverId + "-" + (size || "M") + ".jpg" : "";
+  }
+  function $ (id) { return document.getElementById(id); }
+
+  /* ---------------- data layer (Supabase or localStorage) ---------------- */
+
+  function lsGet(key, fallback) {
+    try { var v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; }
+    catch (e) { return fallback; }
+  }
+  function lsSet(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) {} }
+
+  function showDbError(msg) {
+    var el = $("dbError");
+    if (!el) return;
+    el.textContent = msg;
+    el.classList.remove("hidden");
+  }
+  function clearDbError() {
+    var el = $("dbError");
+    if (el) { el.textContent = ""; el.classList.add("hidden"); }
+  }
+  async function dbWrite(promise, failMsg) {
+    try {
+      var res = await promise;
+      if (res && res.error) { showDbError(failMsg + " — the database said: " + res.error.message); return false; }
+      clearDbError();
+      return true;
+    } catch (e) {
+      showDbError(failMsg + " — " + (e && e.message ? e.message : "the database could not be reached"));
+      return false;
+    }
+  }
+
+  var db = {
+    async loadAll() {
+      if (connected) {
+        clearDbError();
+        try {
+          var b = await supabase.from("books").select("*").order("created_at", { ascending: true });
+          var s = await supabase.from("reading_sessions").select("*").order("session_date", { ascending: false });
+          var g = await supabase.from("settings").select("*").eq("id", 1).single();
+          var m = await supabase.from("custom_moods").select("*").order("created_at", { ascending: true });
+          if (b.error) { showDbError("Couldn't load your books — the database said: " + b.error.message + ". Nothing was deleted; the app just could not reach your saved books."); }
+          state.books = b.data || [];
+          state.sessions = s.data || [];
+          state.goal = (g.data && g.data.goal_number) || 0;
+          state.customMoods = (m.data || []).map(function (r) { return r.mood; });
+        } catch (e) {
+          showDbError("Couldn't reach your database: " + (e && e.message ? e.message : "network error") + ". Your books are safe in the database; check your connection and reopen the app.");
+          state.books = []; state.sessions = []; state.goal = 0; state.customMoods = [];
+        }
+      } else {
+        state.books = lsGet("mbs_books", []);
+        state.sessions = lsGet("mbs_sessions", []);
+        state.goal = lsGet("mbs_goal", 0);
+        state.customMoods = lsGet("mbs_moods", []);
+      }
+      /* Which categories she chose to show. A device preference, kept
+         on the phone; untouched until she picks. Empty means default. */
+      state.visibleCategories = lsGet("mbs_visible_categories", []);
+    },
+    async addBook(book) {
+      book.id = uid();
+      book.created_at = new Date().toISOString();
+      if (connected) {
+        var ok = await dbWrite(supabase.from("books").insert(book), "Couldn't save \"" + book.title + "\"");
+        if (!ok) return null;
+        state.books.push(book);
+      }
+      else { state.books.push(book); lsSet("mbs_books", state.books); }
+      return book;
+    },
+    async updateBook(id, patch) {
+      var book = state.books.find(function (b) { return b.id === id; });
+      if (!book) return;
+      if (connected) {
+        var ok = await dbWrite(supabase.from("books").update(patch).eq("id", id), "Couldn't save your changes");
+        if (!ok) return;
+        Object.assign(book, patch);
+      }
+      else { Object.assign(book, patch); lsSet("mbs_books", state.books); }
+    },
+    async deleteBook(id) {
+      if (connected) {
+        var ok = await dbWrite(supabase.from("books").delete().eq("id", id), "Couldn't remove that book");
+        if (!ok) return;
+        state.books = state.books.filter(function (b) { return b.id !== id; });
+      }
+      else { state.books = state.books.filter(function (b) { return b.id !== id; }); lsSet("mbs_books", state.books); }
+    },
+    async addSession(session) {
+      session.id = uid();
+      if (connected) {
+        var ok = await dbWrite(supabase.from("reading_sessions").insert(session), "Couldn't save that reading session");
+        if (!ok) return null;
+        state.sessions.unshift(session);
+      }
+      else { state.sessions.unshift(session); lsSet("mbs_sessions", state.sessions); }
+      return session;
+    },
+    async deleteSession(id) {
+      if (connected) {
+        var ok = await dbWrite(supabase.from("reading_sessions").delete().eq("id", id), "Couldn't remove that session");
+        if (!ok) return;
+        state.sessions = state.sessions.filter(function (s) { return s.id !== id; });
+      }
+      else { state.sessions = state.sessions.filter(function (s) { return s.id !== id; }); lsSet("mbs_sessions", state.sessions); }
+    },
+    async setGoal(n) {
+      if (connected) {
+        var ok = await dbWrite(supabase.from("settings").upsert({ id: 1, goal_number: n }), "Couldn't save your goal");
+        if (!ok) return;
+        state.goal = n;
+      }
+      else { state.goal = n; lsSet("mbs_goal", n); }
+    },
+    async addMood(mood) {
+      var clean = mood.trim().toLowerCase();
+      if (!clean) return false;
+      /* No built-in block anymore: jar options come from her books now,
+         so any word she types, old built-in included, is hers to save. */
+      if (state.customMoods.some(function (m) { return m.toLowerCase() === clean; })) return false;
+      if (connected) {
+        var ok = await dbWrite(supabase.from("custom_moods").insert({ mood: clean }), "Couldn't save that mood");
+        if (!ok) return false;
+        state.customMoods.push(clean);
+      }
+      else { state.customMoods.push(clean); lsSet("mbs_moods", state.customMoods); }
+      return true;
+    },
+    async removeMood(mood) {
+      if (connected) {
+        var ok = await dbWrite(supabase.from("custom_moods").delete().eq("mood", mood), "Couldn't remove that mood");
+        if (!ok) return;
+      }
+      state.customMoods = state.customMoods.filter(function (m) { return m !== mood; });
+      state.pickedMoods = state.pickedMoods.filter(function (m) { return m !== mood; });
+      if (!connected) lsSet("mbs_moods", state.customMoods);
+    }
+  };
+
+  /* ---------------- Open Library catalogue ---------------- */
+
+  async function searchCatalogue(query, limit) {
+    var url = "https://openlibrary.org/search.json?q=" + encodeURIComponent(query) +
+      "&limit=" + (limit || 15) +
+      "&fields=key,title,author_name,first_publish_year,cover_i,number_of_pages_median,subject";
+    var res = await fetch(url);
+    var data = await res.json();
+    return (data.docs || []).map(function (d) {
+      return {
+        workKey: d.key || "",
+        title: d.title || "Untitled",
+        author: (d.author_name && d.author_name[0]) || "Unknown author",
+        year: d.first_publish_year || null,
+        coverId: d.cover_i || null,
+        pages: d.number_of_pages_median || null,
+        subjects: d.subject || []
+      };
+    });
+  }
+
+  async function fetchSynopsis(book) {
+    // Prefer the saved work key; fall back to an exact title + author search.
+    var workKey = book.work_key || book.workKey || "";
+    if (!workKey && book.title) {
+      try {
+        var results = await searchCatalogue(book.title + " " + (book.author || ""), 3);
+        var exact = results.find(function (r) {
+          return r.title.toLowerCase() === (book.title || "").toLowerCase();
+        });
+        workKey = (exact || results[0] || {}).workKey || "";
+      } catch (e) { workKey = ""; }
+    }
+    if (!workKey) return null;
+    try {
+      var res = await fetch("https://openlibrary.org" + workKey + ".json");
+      var data = await res.json();
+      var desc = data.description;
+      if (typeof desc === "string") return desc;
+      if (desc && typeof desc.value === "string") return desc.value;
+      return null;
+    } catch (e) { return null; }
+  }
+
+  /* ---------------- rendering: Home shelf ---------------- */
+
+  /* How many books fit on one wood shelf at the current width.
+     Book = 74px wide, 12px gaps, 12px padding on each side. */
+  var lastPerRow = 0;
+  function booksPerRow(area) {
+    var w = (area && area.clientWidth) ? area.clientWidth : 390;
+    var n = Math.floor((w - 24 + 12) / (74 + 12));
+    return Math.max(1, Math.min(8, n));
+  }
+
+  function bookThumb(book) {
+    if (book.cover_url) {
+      return '<img src="' + esc(book.cover_url) + '" alt="Cover of ' + esc(book.title) + '" loading="lazy" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'">' +
+        '<span class="spine-fallback" style="display:none">' + esc(book.title) + '</span>';
+    }
+    return '<span class="spine-fallback">' + esc(book.title) + '</span>';
+  }
+
+  function renderHome() {
+    var shelf = state.homeShelf;
+    var books = state.books.filter(function (b) { return b.status === shelf; });
+    ["tbr", "read", "dnf"].forEach(function (s) {
+      var n = state.books.filter(function (b) { return b.status === s; }).length;
+      var el = $("count-" + s);
+      if (el) el.textContent = n ? "(" + n + ")" : "";
+    });
+    var area = $("shelfArea");
+    if (!books.length) {
+      area.innerHTML = "";
+      return;
+    }
+    /* One real wood shelf under every row of books — no drawn plants. */
+    var perRow = booksPerRow(area);
+    lastPerRow = perRow;
+    var html = "";
+    for (var r = 0; r < books.length; r += perRow) {
+      html += '<div class="shelf-unit"><div class="shelf-books">';
+      books.slice(r, r + perRow).forEach(function (book) {
+        var starCount = Math.max(0, Math.min(5, parseInt(book.stars, 10) || 0));
+        var stars = starCount ? '<span class="book-stars">' + "★".repeat(starCount) + '</span>' : '';
+        html += '<button class="book" type="button" data-book-id="' + esc(book.id) + '">' +
+          bookThumb(book) +
+          '<span class="book-title">' + esc(book.title) + '</span>' + (book.format === "audio" ? '<span aria-label="Audiobook"> 🎧</span>' : '') + stars + '</button>';
+      });
+      html += '</div><div class="shelf-plank"></div></div>';
+    }
+    area.innerHTML = html;
+    area.querySelectorAll("[data-book-id]").forEach(function (btn) {
+      btn.addEventListener("click", function () { openBook(btn.getAttribute("data-book-id")); });
+    });
+  }
+
+  /* ---------------- rendering: Goal ---------------- */
+
+  /* Goal spines per row: spine = 26px wide, 4px gaps, 10px padding each side. */
+  var lastGoalPerRow = 0;
+  function goalPerRow(area) {
+    var w = (area && area.clientWidth) ? area.clientWidth : 390;
+    var n = Math.floor((w - 20 + 4) / (26 + 4));
+    return Math.max(1, Math.min(12, n));
+  }
+
+  function renderGoal() {
+    var y = yearNow();
+    $("goalYear").textContent = y;
+    var tbr = state.books.filter(function (b) { return b.status === "tbr"; }).length;
+    var read = state.books.filter(function (b) { return b.status === "read" && b.finished_year === y; });
+    $("statTbr").textContent = tbr;
+    $("statGoal").textContent = state.goal;
+    $("statRead").textContent = read.length;
+    var left = Math.max(0, state.goal - read.length);
+    $("goalLeft").textContent = state.goal > 0
+      ? "You have " + left + " book" + (left === 1 ? "" : "s") + " left to complete your yearly reading goal."
+      : "Set a goal number below and your shelf will fill in as you finish books.";
+    $("goalInput").value = state.goal || "";
+    var shelf = $("goalShelf");
+    if (state.goal <= 0) {
+      shelf.style.display = "none";
+      shelf.innerHTML = "";
+      return;
+    }
+    shelf.style.display = "block";
+    var spines = [];
+    read.forEach(function (book, i) {
+      var color = SPINE_COLORS[i % SPINE_COLORS.length];
+      spines.push('<button class="goal-spine" type="button" title="' + esc(book.title) + '" data-book-id="' + esc(book.id) + '" style="background:' + color + '"><span class="goal-spine-title">' + esc(book.title) + '</span></button>');
+    });
+    for (var i = read.length; i < state.goal; i++) {
+      spines.push('<span class="goal-spine empty">' + (i + 1) + '</span>');
+    }
+    /* One real wood shelf under every row of spines, same as Home. */
+    var perRow = goalPerRow(shelf);
+    lastGoalPerRow = perRow;
+    var html = "";
+    for (var r = 0; r < spines.length; r += perRow) {
+      html += '<div class="goal-unit"><div class="goal-row">' + spines.slice(r, r + perRow).join("") + '</div><div class="shelf-plank"></div></div>';
+    }
+    shelf.innerHTML = html;
+    shelf.querySelectorAll("[data-book-id]").forEach(function (btn) {
+      btn.addEventListener("click", function () { openBook(btn.getAttribute("data-book-id")); });
+    });
+  }
+
+  /* ---------------- rendering: Jar moods ---------------- */
+
+  function allMoods() { return BUILTIN_MOODS.concat(state.customMoods); }
+
+  /* One shared set of tag choices, used wherever she tags a book: the
+     tags already on her books, the moods she saved herself, and the
+     Suggest categories, so the same words are on offer everywhere.
+     Free-text typing stays alongside it, so she is never limited to
+     this list. */
+  function tagChoiceOptions() {
+    var seen = {}, list = [];
+    function push(v) {
+      var key = (v || "").toLowerCase().trim();
+      if (!key || seen[key]) return;
+      seen[key] = true;
+      list.push(v);
+    }
+    state.books.forEach(function (b) { (b.tags || []).forEach(push); });
+    state.customMoods.forEach(push);
+    SUGGEST_CATEGORIES.forEach(function (c) { push(c.label); });
+    return list;
+  }
+
+  function renderJar() {
+    var suggest = state.jarMode === "suggest";
+    $("jarModeCopy").textContent = suggest
+      ? "This one looks outside your shelves. Pick one or more categories below, then tap the jar and it will suggest a book from Open Library that is not on any of your shelves. Or search for a book by name below."
+      : "This one picks from your own shelves. Pick one or more moods below, then tap the jar and it will shake out a book from your To Be Read shelf.";
+    $("jarPickHeading").textContent = suggest
+      ? "Which categories? Pick as many as you like"
+      : "What mood are you in? Pick as many as you like";
+    $("jarPickHint").textContent = suggest
+      ? "Tap to select or deselect. Suggestions only serve books in every category you pick. Or search for a book by name below."
+      : "These are the tags on your To Be Read books, plus the ones you made yourself. Tap to select. The number is how many books carry that tag.";
+    $("modeShelfBtn").classList.toggle("active", !suggest);
+    $("modeSuggestBtn").classList.toggle("active", suggest);
+    var chips = $("moodChips");
+    var html = "";
+    if (suggest) {
+      /* Proper categories only, and only the ones she chose to show.
+         No mood words, no wall of chips. Typing her own words lives
+         in the book search box below the chips. */
+      visibleCategoryList().forEach(function (label) {
+        var sel = state.pickedCategories.indexOf(label) !== -1;
+        html += '<button class="chip' + (sel ? " selected" : "") + '" type="button" data-category="' + esc(label) + '">' + esc(label) + '</button>';
+      });
+      html += '<button class="chip' + (state.surprise ? " selected" : "") + '" type="button" data-category="__surprise">Surprise me — any category</button>';
+      html += '<div class="row" style="margin-top:8px"><button id="chooseCatBtn" class="mini-btn" type="button">Choose categories</button></div>';
+    } else {
+      /* Jar options match her list now: the tags actually on her To Be
+         Read books, plus the moods she made herself. A built-in mood
+         that is on no book and she never saved simply does not show —
+         she can type it into Add mood and it is back for good. If no
+         book is tagged yet, the old mood list stays so the jar is
+         never empty. Counts on each chip show how many books carry it,
+         so a shake never surprises her with nothing. */
+      var bookTags = [], seenTags = {};
+      state.books.filter(function (b) { return b.status === "tbr"; }).forEach(function (b) {
+        (b.tags || []).forEach(function (t) {
+          var key = (t || "").toLowerCase().trim();
+          if (!key || seenTags[key]) return;
+          seenTags[key] = true;
+          bookTags.push(t);
+        });
+      });
+      var shelfOptions = bookTags.slice();
+      state.customMoods.forEach(function (m) {
+        var key = (m || "").toLowerCase().trim();
+        if (!key || seenTags[key]) return;
+        seenTags[key] = true;
+        shelfOptions.push(m);
+      });
+      if (!bookTags.length) {
+        shelfOptions = [];
+        var seenFallback = {};
+        allMoods().forEach(function (m) {
+          var key = m.toLowerCase();
+          if (seenFallback[key]) return;
+          seenFallback[key] = true;
+          shelfOptions.push(m);
+        });
+      }
+      /* Drop picked moods that are no longer offered, so no invisible
+         filter can linger after the options change. */
+      var offered = {};
+      shelfOptions.forEach(function (o) { offered[o.toLowerCase()] = true; });
+      state.pickedMoods = state.pickedMoods.filter(function (m) { return !!offered[m.toLowerCase()]; });
+      shelfOptions.forEach(function (mood) {
+        var sel = state.pickedMoods.some(function (m) { return m.toLowerCase() === mood.toLowerCase(); });
+        var count = state.books.filter(function (b) {
+          return b.status === "tbr" && (b.tags || []).some(function (t) { return t.toLowerCase() === mood.toLowerCase(); });
+        }).length;
+        html += '<button class="chip' + (sel ? " selected" : "") + '" type="button" data-mood="' + esc(mood) + '">' + esc(mood) + ' (' + count + ')</button>';
+      });
+      html += '<button class="chip' + (state.surprise ? " selected" : "") + '" type="button" data-mood="__surprise">Surprise me — any mood</button>';
+    }
+    chips.innerHTML = html;
+    chips.querySelectorAll("[data-category]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var label = btn.getAttribute("data-category");
+        if (label === "__surprise") {
+          state.surprise = !state.surprise;
+          if (state.surprise) state.pickedCategories = [];
+        } else {
+          state.surprise = false;
+          var i = state.pickedCategories.indexOf(label);
+          if (i === -1) state.pickedCategories.push(label); else state.pickedCategories.splice(i, 1);
+        }
+        renderJar();
+      });
+    });
+    var chooseBtn = $("chooseCatBtn");
+    if (chooseBtn) chooseBtn.addEventListener("click", openCategoryChooser);
+    chips.querySelectorAll("[data-mood]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var mood = btn.getAttribute("data-mood");
+        if (mood === "__surprise") {
+          state.surprise = !state.surprise;
+          if (state.surprise) state.pickedMoods = [];
+        } else {
+          /* Book tags keep their own casing, so compare lowercase or
+             the same tag picked twice would look unpicked. */
+          state.surprise = false;
+          var key = mood.toLowerCase(), idx = -1;
+          state.pickedMoods.forEach(function (m, i) { if (m.toLowerCase() === key) idx = i; });
+          if (idx === -1) state.pickedMoods.push(mood); else state.pickedMoods.splice(idx, 1);
+        }
+        renderJar();
+      });
+    });
+    /* The type-your-own-mood box is a shelf thing. Suggest has fixed
+       categories only, so it stays hidden there. Suggest's own typing
+       is the book search box, which lives outside the chips so that
+       re-rendering them never wipes what she typed. */
+    $("addMoodRow").style.display = suggest ? "none" : "";
+    $("addMoodNote").style.display = suggest ? "none" : "";
+    var bookSearchRow = $("bookSearchRow");
+    if (bookSearchRow) bookSearchRow.style.display = suggest ? "" : "none";
+    var saved = $("savedMoods");
+    if (suggest) { saved.innerHTML = ""; return; }
+    if (!state.customMoods.length) { saved.innerHTML = ""; return; }
+    saved.innerHTML = "<p class='muted small'><strong>My saved moods</strong></p>" + state.customMoods.map(function (m) {
+      return '<div class="saved-mood-row"><span>' + esc(m) + '</span>' +
+        '<button class="mini-btn" type="button" data-remove-mood="' + esc(m) + '">Remove</button></div>';
+    }).join("");
+    saved.querySelectorAll("[data-remove-mood]").forEach(function (btn) {
+      btn.addEventListener("click", async function () {
+        await db.removeMood(btn.getAttribute("data-remove-mood"));
+        renderJar();
+      });
+    });
+  }
+
+  /* ---------------- rendering: Log ---------------- */
+
+  function renderLog() {
+    var y = yearNow();
+    $("logYear").textContent = y;
+    var finished = state.books.filter(function (b) { return b.status === "read" && b.finished_year === y; });
+    var finishedPages = finished.reduce(function (sum, b) { return sum + (b.pages || 0); }, 0);
+    var yearSessions = state.sessions.filter(function (s) {
+      return s.session_date && s.session_date.indexOf(String(y)) === 0;
+    });
+    var sp = yearSessions.reduce(function (sum, s) { return sum + (s.pages || 0); }, 0);
+    var sc = yearSessions.reduce(function (sum, s) { return sum + (s.chapters || 0); }, 0);
+    var sm = yearSessions.reduce(function (sum, s) { return sum + (s.minutes || 0); }, 0);
+    $("logBooks").textContent = finished.length;
+    $("logPages").textContent = finishedPages + sp;
+    $("logChapters").textContent = sc;
+    $("logMinutes").textContent = sm;
+    $("logBreakdown").textContent = finishedPages + " pages from finished books + " + sp + " pages from sessions.";
+    var sel = $("sessionBook");
+    sel.innerHTML = '<option value="">Just a session (no book)</option>' + state.books.map(function (b) {
+      return '<option value="' + esc(b.id) + '">' + esc(b.title) + '</option>';
+    }).join("");
+    var list = $("sessionList");
+    if (!state.sessions.length) { list.innerHTML = '<p class="muted">No sessions logged yet.</p>'; return; }
+    list.innerHTML = state.sessions.map(function (s) {
+      var parts = [];
+      if (s.pages) parts.push(s.pages + " pages");
+      if (s.chapters) parts.push(s.chapters + " chapters");
+      if (s.minutes) parts.push(s.minutes + " min");
+      var book = s.book_id ? state.books.find(function (b) { return b.id === s.book_id; }) : null;
+      var name = book ? book.title : (s.book_title || "Session");
+      return '<div class="session-row"><span><strong>' + esc(name) + '</strong> — ' + esc(s.session_date || "") + ' · ' + parts.join(", ") + '</span>' +
+        '<button class="mini-btn" type="button" data-del-session="' + esc(s.id) + '">Remove</button></div>';
+    }).join("");
+    list.querySelectorAll("[data-del-session]").forEach(function (btn) {
+      btn.addEventListener("click", async function () {
+        await db.deleteSession(btn.getAttribute("data-del-session"));
+        renderAll();
+      });
+    });
+  }
+
+  function renderAll() { renderHome(); renderGoal(); renderJar(); renderLog(); }
+
+  /* ---------------- tabs & shelf switch ---------------- */
+
+  function showPage(page) {
+    state.page = page;
+    document.querySelectorAll(".page").forEach(function (p) { p.classList.remove("active"); });
+    $("page-" + page).classList.add("active");
+    /* Jar chips come from her books now, and books get retagged in the
+       popup, so the jar must refresh every time its tab opens, or it
+       would keep showing the chips from when the app first loaded. */
+    if (page === "jar") renderJar();
+    document.querySelectorAll(".tab-btn").forEach(function (b) {
+      b.classList.toggle("active", b.getAttribute("data-page") === page);
+    });
+    window.scrollTo(0, 0);
+  }
+
+  /* ---------------- book detail / About modal ---------------- */
+
+  function starRow(book) {
+    var html = '<div class="stars-row">';
+    for (var i = 1; i <= 5; i++) {
+      html += '<button class="rate-btn' + ((book.stars || 0) >= i ? " selected" : "") + '" type="button" data-stars="' + i + '" aria-label="' + i + ' stars">&#9733;</button>';
+    }
+    return html + "</div>";
+  }
+  function listeningTime(bookId) {
+    var mins = 0;
+    state.sessions.forEach(function (s) {
+      if (s.book_id === bookId) mins += (parseInt(s.minutes, 10) || 0);
+    });
+    if (!mins) return "not logged yet";
+    var h = Math.floor(mins / 60), m = mins % 60;
+    return (h ? h + "h " : "") + (m ? m + "m" : "0m");
+  }
+  function spiceRow(book) {
+    var html = '<div class="spice-row">';
+    for (var i = 1; i <= 5; i++) {
+      html += '<button class="rate-btn' + ((book.spice || 0) >= i ? " spice-selected" : "") + '" type="button" data-spice="' + i + '" aria-label="Spice level ' + i + '">' + i + '</button>';
+    }
+    return html + "</div>";
+  }
+
+  function openBook(id) {
+    var book = state.books.find(function (b) { return b.id === id; });
+    if (!book) return;
+    state.currentModalBookId = id;
+    state.currentPreview = null;
+    renderModal(book, false);
+    $("bookModal").classList.remove("hidden");
+  }
+
+  function openPreview(result) {
+    state.currentModalBookId = null;
+    state.currentPreview = result;
+    var already = state.books.find(function (b) { return normKey(b.title, b.author) === normKey(result.title, result.author); });
+    renderModal({
+      id: null, title: result.title, author: result.author, year: result.year,
+      cover_url: coverUrl(result.coverId, "L"), pages: result.pages,
+      work_key: result.workKey, status: already ? already.status : null,
+      tags: [], stars: null, spice: null, reread: null, notes: ""
+    }, true, already);
+    $("bookModal").classList.remove("hidden");
+  }
+
+  function openSuggestionPreview(book) {
+    var already = state.books.find(function (b) { return normKey(b.title, b.author) === normKey(book.title, book.author); });
+    var coverId = null;
+    if (book.cover_url) {
+      var m = book.cover_url.match(/\/b\/id\/(\d+)-/);
+      if (m) coverId = m[1];
+    }
+    state.currentModalBookId = null;
+    state.currentPreview = { title: book.title, author: book.author, year: book.year, pages: book.pages, coverId: coverId, workKey: book.work_key };
+    renderModal({
+      id: null, title: book.title, author: book.author, year: book.year,
+      cover_url: book.cover_url, pages: book.pages,
+      work_key: book.work_key, status: already ? already.status : null,
+      tags: [], stars: null, spice: null, reread: null, notes: ""
+    }, true, already);
+    $("bookModal").classList.remove("hidden");
+  }
+
+  function closeModal() {
+    $("bookModal").classList.add("hidden");
+    state.currentModalBookId = null;
+    state.currentPreview = null;
+  }
+
+  function renderModal(book, isPreview, already) {
+    var c = $("modalContent");
+    var tags = book.tags || [];
+    var html = '<div class="modal-book">' +
+      (book.cover_url ? '<img src="' + esc(book.cover_url) + '" alt="Cover of ' + esc(book.title) + '">' : "") +
+      '<div class="modal-meta"><h2>' + esc(book.title) + '</h2>' +
+      '<p class="muted">' + esc(book.author || "") + (book.year ? " · " + book.year : "") + (book.pages ? " · " + book.pages + " pages" : "") + '</p>' +
+      (book.status ? '<p><strong>Shelf:</strong> ' + (book.status === "tbr" ? "To Be Read" : book.status === "read" ? "Read" : "DNF") + '</p>' : "") +
+      "</div></div>" +
+      '<div class="about-box"><h3>About this book</h3><p id="aboutText" class="muted" data-book="' + esc(String(book.id)) + '" data-work="' + esc(String(book.work_key || "")) + '"' + (book.synopsis ? ' data-custom="1"' : "") + '>Loading the synopsis…</p></div>';
+
+    if (isPreview) {
+      html += already
+        ? '<p class="muted">This book is already on your ' + (already.status === "tbr" ? "To Be Read" : already.status === "read" ? "Read" : "DNF") + ' shelf.</p>'
+        : '<button id="previewAddBtn" class="btn-primary" type="button" style="margin-top:12px">Add to my TBR shelf</button>';
+    } else {
+      html += '<div class="status-row">' +
+        '<button class="mini-btn" type="button" data-move="tbr">Move to TBR</button>' +
+        '<button class="mini-btn" type="button" data-move="read">Mark as Read</button>' +
+        '<button class="mini-btn" type="button" data-move="dnf">Mark as DNF</button></div>';
+      html += '<div class="format-row"><span class="muted small">Format: </span>' +
+        '<button class="mini-btn" type="button" data-format="book"' + (book.format !== "audio" ? ' style="background:var(--mahogany);color:#fff"' : "") + '>Book</button>' +
+        '<button class="mini-btn" type="button" data-format="audio"' + (book.format === "audio" ? ' style="background:var(--mahogany);color:#fff"' : "") + '>Audio 🎧</button></div>';
+      if (book.format === "audio") {
+        html += '<p class="muted small">Listening time: ' + listeningTime(book.id) + '</p>';
+      }
+      html += '<div><label class="field-label" for="bookCoverInput">Cover photo</label>' +
+        '<input id="bookCoverInput" type="file" accept="image/*">' +
+        (book.cover_url ? '<img id="bookCoverPreview" class="cover-preview" src="' + esc(book.cover_url) + '" alt="">' : '<img id="bookCoverPreview" class="cover-preview hidden" alt="">') + '</div>';
+      html += '<h3>Your tags</h3><div class="tag-row">' + tags.map(function (t) {
+        return '<button class="chip selected" type="button" data-untag="' + esc(t) + '">' + esc(t) + ' &times;</button>';
+      }).join("") + "</div>" +
+        '<div class="row"><input id="bookTagInput" type="text" placeholder="Add a mood tag, e.g. cozy">' +
+        '<button id="bookTagAddBtn" class="btn-secondary" type="button">Add tag</button></div>' +
+        '<p class="muted small">Or tap one to add it:</p><div class="tag-row">' + tagChoiceOptions().filter(function (t) {
+          return tags.map(function (x) { return x.toLowerCase(); }).indexOf(t.toLowerCase()) === -1;
+        }).map(function (t) {
+          return '<button class="chip" type="button" data-addtag="' + esc(t) + '">' + esc(t) + '</button>';
+        }).join("") + '</div>';
+      if (book.status === "read") {
+        html += '<h3>Your rating</h3><p class="muted small">Stars</p>' + starRow(book) +
+          '<p class="muted small">Spice level (1–5)</p>' + spiceRow(book) +
+          '<p class="muted small">Would you read it again?</p><div class="reread-row">' +
+          '<button class="mini-btn" type="button" data-reread="yes"' + (book.reread === "yes" ? ' style="background:var(--mahogany);color:#fff"' : "") + '>Yes</button>' +
+          '<button class="mini-btn" type="button" data-reread="no"' + (book.reread === "no" ? ' style="background:var(--mahogany);color:#fff"' : "") + '>No</button></div>';
+      }
+      html += '<label class="field-label" for="bookSynopsis">Synopsis</label>' +
+        '<textarea id="bookSynopsis" rows="4" placeholder="Write your own synopsis here">' + esc(book.synopsis || "") + '</textarea>' +
+        '<button id="synopsisSaveBtn" class="btn-secondary" type="button" style="margin-top:8px">Save synopsis</button>' +
+        '<label class="field-label" for="bookNotes">Notes</label>' +
+        '<textarea id="bookNotes" rows="3" placeholder="What did you think?">' + esc(book.notes || "") + '</textarea>' +
+        '<button id="notesSaveBtn" class="btn-secondary" type="button" style="margin-top:8px">Save notes</button>' +
+        '<div style="margin-top:14px"><button id="bookDeleteBtn" class="danger-btn" type="button">Remove this book</button></div>';
+    }
+    c.innerHTML = html;
+
+    /* Her own synopsis wins over the catalogue's. The guards keep a
+       stale catalogue fetch from overwriting a newer modal, or a
+       synopsis she just saved, when the same book reopens. */
+    if (book.synopsis) {
+      var aboutEl = $("aboutText");
+      if (aboutEl) aboutEl.textContent = book.synopsis;
+    } else {
+      fetchSynopsis(book).then(function (syn) {
+        var el = $("aboutText");
+        if (el && !el.dataset.custom && el.dataset.book === String(book.id) && el.dataset.work === String(book.work_key || "")) el.textContent = syn || "No synopsis listed for this book in the catalogue.";
+      });
+    }
+
+    if (isPreview) {
+      var addBtn = $("previewAddBtn");
+      if (addBtn) addBtn.addEventListener("click", async function () {
+        var r = state.currentPreview;
+        var saved = await db.addBook({
+          title: r.title, author: r.author, year: r.year,
+          cover_url: coverUrl(r.coverId, "L"), pages: r.pages,
+          work_key: r.workKey, status: "tbr", tags: []
+        });
+        if (!saved) return;
+        closeModal(); renderAll();
+      });
+      return;
+    }
+
+    c.querySelectorAll("[data-move]").forEach(function (btn) {
+      btn.addEventListener("click", async function () {
+        var to = btn.getAttribute("data-move");
+        var patch = { status: to, finished_year: to === "read" ? yearNow() : null };
+        await db.updateBook(book.id, patch);
+        closeModal(); renderAll();
+      });
+    });
+    c.querySelectorAll("[data-format]").forEach(function (btn) {
+      btn.addEventListener("click", async function () {
+        await db.updateBook(book.id, { format: btn.getAttribute("data-format") });
+        openBook(book.id); renderHome();
+      });
+    });
+    c.querySelectorAll("[data-stars]").forEach(function (btn) {
+      btn.addEventListener("click", async function () {
+        await db.updateBook(book.id, { stars: parseInt(btn.getAttribute("data-stars"), 10) });
+        openBook(book.id); renderHome();
+      });
+    });
+    c.querySelectorAll("[data-spice]").forEach(function (btn) {
+      btn.addEventListener("click", async function () {
+        await db.updateBook(book.id, { spice: parseInt(btn.getAttribute("data-spice"), 10) });
+        openBook(book.id); renderHome();
+      });
+    });
+    c.querySelectorAll("[data-reread]").forEach(function (btn) {
+      btn.addEventListener("click", async function () {
+        await db.updateBook(book.id, { reread: btn.getAttribute("data-reread") });
+        openBook(book.id); renderHome();
+      });
+    });
+    c.querySelectorAll("[data-untag]").forEach(function (btn) {
+      btn.addEventListener("click", async function () {
+        var tag = btn.getAttribute("data-untag");
+        var next = (book.tags || []).filter(function (t) { return t !== tag; });
+        await db.updateBook(book.id, { tags: next });
+        openBook(book.id); renderHome();
+      });
+    });
+    $("bookTagAddBtn").addEventListener("click", async function () {
+      var val = $("bookTagInput").value.trim().toLowerCase();
+      if (!val) return;
+      var tags = book.tags || [];
+      if (tags.indexOf(val) === -1) tags.push(val);
+      await db.updateBook(book.id, { tags: tags });
+      openBook(book.id); renderHome();
+    });
+    c.querySelectorAll("[data-addtag]").forEach(function (btn) {
+      btn.addEventListener("click", async function () {
+        var val = btn.getAttribute("data-addtag").toLowerCase();
+        var tags = book.tags || [];
+        if (tags.indexOf(val) === -1) tags.push(val);
+        await db.updateBook(book.id, { tags: tags });
+        openBook(book.id); renderHome();
+      });
+    });
+    var coverInput = $("bookCoverInput");
+    if (coverInput) coverInput.addEventListener("change", function (e) {
+      var f = e.target.files && e.target.files[0];
+      if (!f) return;
+      var reader = new FileReader();
+      reader.onload = async function () {
+        await db.updateBook(book.id, { cover_url: reader.result });
+        openBook(book.id); renderHome();
+      };
+      reader.readAsDataURL(f);
+    });
+    $("synopsisSaveBtn").addEventListener("click", async function () {
+      await db.updateBook(book.id, { synopsis: $("bookSynopsis").value.trim() });
+      openBook(book.id);
+    });
+    $("notesSaveBtn").addEventListener("click", async function () {
+      await db.updateBook(book.id, { notes: $("bookNotes").value });
+      closeModal(); renderAll();
+    });
+    $("bookDeleteBtn").addEventListener("click", async function () {
+      if (!confirm("Remove \"" + book.title + "\" from your shelves?")) return;
+      await db.deleteBook(book.id);
+      closeModal(); renderAll();
+    });
+  }
+
+  /* ---------------- add a book: catalogue search + by hand ---------------- */
+
+  var manualCoverData = "";
+  $("manualCover").addEventListener("change", function (e) {
+    var file = e.target.files[0];
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function () {
+      manualCoverData = reader.result;
+      var img = $("manualCoverPreview");
+      img.src = manualCoverData;
+      img.classList.remove("hidden");
+    };
+    reader.readAsDataURL(file);
+  });
+
+  async function runSearch() {
+    var q = $("searchInput").value.trim();
+    if (!q) return;
+    $("searchStatus").textContent = "Searching the catalogue…";
+    $("searchResults").innerHTML = "";
+    try {
+      var results = await searchCatalogue(q, 15);
+      if (!results.length) { $("searchStatus").textContent = "Nothing found. Try another title, or add it by hand below."; return; }
+      $("searchStatus").textContent = results.length + " found. Tap About to read what it is about first, or Add to put it straight on your TBR shelf.";
+      $("searchResults").innerHTML = results.map(function (r, i) {
+        return '<div class="result-row">' +
+          (r.coverId ? '<img src="' + coverUrl(r.coverId, "M") + '" alt="">' : "") +
+          '<div class="result-info"><strong>' + esc(r.title) + '</strong>' +
+          '<span>' + esc(r.author) + (r.year ? " · " + r.year : "") + (r.pages ? " · " + r.pages + " pages" : "") + '</span></div>' +
+          '<div class="result-actions">' +
+          '<button class="mini-btn" type="button" data-about="' + i + '">About</button>' +
+          '<button class="mini-btn" type="button" data-add="' + i + '">Add</button></div></div>';
+      }).join("");
+      $("searchResults").querySelectorAll("[data-about]").forEach(function (btn) {
+        btn.addEventListener("click", function () { openPreview(results[parseInt(btn.getAttribute("data-about"), 10)]); });
+      });
+      $("searchResults").querySelectorAll("[data-add]").forEach(function (btn) {
+        btn.addEventListener("click", async function () {
+          var r = results[parseInt(btn.getAttribute("data-add"), 10)];
+          var saved = await db.addBook({
+            title: r.title, author: r.author, year: r.year,
+            cover_url: coverUrl(r.coverId, "L"), pages: r.pages,
+            work_key: r.workKey, status: "tbr", tags: []
+          });
+          if (!saved) return;
+          btn.textContent = "Added ✓"; btn.disabled = true;
+          renderAll();
+        });
+      });
+    } catch (e) {
+      $("searchStatus").textContent = "Search needs internet and did not go through. Check your connection and try again, or add the book by hand below.";
+    }
+  }
+
+  /* ---------------- jar: shelf picks + new-book suggestions ---------------- */
+
+  function shelvedKeys() {
+    var set = {};
+    state.books.forEach(function (b) { set[normKey(b.title, b.author)] = true; });
+    return set;
+  }
+
+  function pickCardHTML(book, extra) {
+    return '<div class="pick-card pick-tap" title="Tap to read About this book">' +
+      (book.cover_url ? '<img src="' + esc(book.cover_url) + '" alt="">' : "") +
+      '<div class="pick-info"><strong>' + esc(book.title) + '</strong>' +
+      '<span class="muted">' + esc(book.author || "") + (book.year ? " · " + book.year : "") + (book.pages ? " · " + book.pages + " pages" : "") + '</span>' +
+      (extra || "") + "</div></div>";
+  }
+
+  function jarButtonsHTML(mode) {
+    var clearBtn = '<div style="margin-top:10px;text-align:center"><button id="clearPickBtn" class="mini-btn" type="button">Clear this pick &times;</button></div>';
+    if (mode === "shelf") {
+      return '<div class="row" style="margin-top:10px"><button id="shakeAgainBtn" class="btn-secondary" type="button">Shake again</button>' +
+        '<button id="viewPickBtn" class="btn-primary" type="button">View book</button></div>' + clearBtn;
+    }
+    return '<div class="row" style="margin-top:10px"><button id="aboutPickBtn" class="btn-secondary" type="button">About this book</button>' +
+      '<button id="addPickBtn" class="btn-primary" type="button">Add to my TBR shelf</button></div>' +
+      '<div class="row" style="margin-top:10px"><button id="anotherPickBtn" class="btn-secondary" type="button">Another suggestion</button></div>' + clearBtn;
+  }
+
+  function showPick(book, mode, matchedTags, closest) {
+    var extra = "";
+    if (matchedTags && matchedTags.length) {
+      extra = '<div style="margin-top:8px">' +
+        (closest ? '<span class="closest-label">Closest match — </span>' : "") +
+        matchedTags.map(function (t) { return '<span class="match-chip">' + esc(t) + '</span>'; }).join("") + "</div>";
+    }
+    $("jarResult").innerHTML = "<h3>The jar has spoken" + (matchedTags && matchedTags.length ? " — " + esc(matchedTags.join(", ")) : "") + "</h3>" +
+      pickCardHTML(book, extra) + jarButtonsHTML(mode);
+    var pickCard = $("jarResult").querySelector(".pick-card");
+    if (pickCard) pickCard.addEventListener("click", function () {
+      if (mode === "shelf") { closeModal(); openBook(book.id); }
+      else { closeModal(); openSuggestionPreview(book); }
+    });
+    var clearBtn = $("clearPickBtn");
+    if (clearBtn) clearBtn.addEventListener("click", function () { $("jarResult").innerHTML = ""; });
+    if (mode === "shelf") {
+      $("shakeAgainBtn").addEventListener("click", doShake);
+      $("viewPickBtn").addEventListener("click", function () { closeModal(); openBook(book.id); });
+    } else {
+      $("aboutPickBtn").addEventListener("click", function () { closeModal(); openSuggestionPreview(book); });
+      $("addPickBtn").addEventListener("click", async function () {
+        var saved = await db.addBook({
+          title: book.title, author: book.author, year: book.year,
+          cover_url: book.cover_url, pages: book.pages,
+          work_key: book.work_key, status: "tbr", tags: matchedTags || []
+        });
+        if (!saved) return;
+        $("jarResult").innerHTML += '<p class="muted">Added to your TBR shelf.</p>';
+        renderAll();
+      });
+      $("anotherPickBtn").addEventListener("click", doShake);
+    }
+  }
+
+  function shelfPick() {
+    var tbr = state.books.filter(function (b) { return b.status === "tbr"; });
+    if (!tbr.length) {
+      $("jarResult").innerHTML = '<p class="muted">Your To Be Read shelf is empty, so the jar has nothing to pick from yet. Add a book first, or switch to Suggest something new.</p>';
+      return;
+    }
+    var pool = tbr;
+    if (!state.surprise && state.pickedMoods.length) {
+      pool = tbr.filter(function (b) {
+        var tags = (b.tags || []).map(function (t) { return t.toLowerCase(); });
+        return state.pickedMoods.some(function (m) { return tags.indexOf(m.toLowerCase()) !== -1; });
+      });
+    }
+    if (!pool.length) {
+      $("jarResult").innerHTML = '<p class="muted">Nothing on your To Be Read shelf matches ' +
+        esc(state.pickedMoods.join(", ")) + '.</p>' +
+        '<button id="fallbackSuggestBtn" class="btn-primary" type="button">Look in the catalogue categories instead</button>';
+      $("fallbackSuggestBtn").addEventListener("click", function () {
+        state.jarMode = "suggest";
+        renderJar();
+        doShake();
+      });
+      return;
+    }
+    var book = pool[Math.floor(Math.random() * pool.length)];
+    showPick(book, "shelf", null, false);
+  }
+
+  function tagMatchesIn(haystack, tag) {
+    var t = tag.toLowerCase();
+    if (haystack.indexOf(t) !== -1) return true;
+    var words = t.split(/[^a-z0-9]+/).filter(Boolean);
+    if (!words.length) return false;
+    return words.every(function (w) { return haystack.indexOf(w) !== -1; });
+  }
+
+  /* Proper book categories for Suggest mode. Not her mood words, not
+     her tags: the catalogue's own categories, picked as-is, matched
+     against each book's subjects. Nothing to guess or get wrong. */
+  var SUGGEST_CATEGORIES = [
+    { label: "African American Romance", query: "african american romance", groups: [["african", "american", "romance"], ["african", "american", "love"]] },
+    /* Black vampire romance, in her words. The catalogue does carry
+       these (Stina 2017-2019, L.A. Banks's Vampire Huntress books),
+       but almost never labels one book both "african american romance"
+       and "vampire romance", so the two separate categories could never
+       reach them together. This one searches the books directly. */
+    { label: "Black Vampire Romance", query: "african american vampires", groups: [["african", "american", "vampire", "romance"]] },
+    { label: "Erotic Romance", query: "erotic romance", groups: [["erotic"]] },
+    { label: "Romantic Fantasy", query: "romantic fantasy", groups: [["romantic", "fantasy"], ["fantasy", "romance"]] },
+    { label: "Vampire Romance", query: "vampire romance", groups: [["vampire", "romance"], ["vampire", "fantasy"]] },
+    { label: "Paranormal Romance", query: "paranormal romance", groups: [["paranormal", "romance"]] },
+    { label: "Dark Fantasy", query: "dark fantasy", groups: [["dark", "fantasy"]] },
+    { label: "Fantasy", query: "fantasy", groups: [["fantasy"]] },
+    { label: "Young Adult Fantasy", query: "young adult fantasy", groups: [["young", "adult", "fantasy"]] },
+    { label: "Romance", query: "romance", groups: [["romance"]] },
+    { label: "Adult Romance", query: "romance", groups: [["romance"]], exclude: [["young", "adult"]] },
+    { label: "Mystery", query: "mystery", groups: [["mystery"]] },
+    { label: "Cozy Mystery", query: "cozy mystery", groups: [["cozy", "mystery"]] }
+  ];
+  function categoryByLabel(label) {
+    var l = (label || "").toLowerCase();
+    for (var i = 0; i < SUGGEST_CATEGORIES.length; i++) {
+      if (SUGGEST_CATEGORIES[i].label.toLowerCase() === l) return SUGGEST_CATEGORIES[i];
+    }
+    return null;
+  }
+  function categoryMatches(hay, label) {
+    var c = categoryByLabel(label);
+    if (!c) return tagMatchesIn(hay, label);
+    var ok = c.groups.some(function (g) {
+      return g.every(function (w) { return hay.indexOf(w) !== -1; });
+    });
+    if (!ok) return false;
+    /* Adult Romance means romance without the young-adult label. */
+    if (c.exclude) {
+      var bad = c.exclude.some(function (g) {
+        return g.every(function (w) { return hay.indexOf(w) !== -1; });
+      });
+      if (bad) return false;
+    }
+    return true;
+  }
+
+  /* The short list she actually sees. Until she picks her own, a small
+     starter set shows so the page is never a wall of chips. */
+  var DEFAULT_VISIBLE_CATEGORIES = ["African American Romance", "Erotic Romance", "Romantic Fantasy", "Vampire Romance", "Paranormal Romance"];
+  function visibleCategoryList() {
+    var chosen = (state.visibleCategories || []).filter(function (l) { return !!categoryByLabel(l); });
+    if (chosen.length) return chosen;
+    return DEFAULT_VISIBLE_CATEGORIES.slice();
+  }
+
+  /* Pick which categories show up. The rest tuck away; nothing is
+     deleted, and she can bring any of them back here anytime. */
+  function openCategoryChooser() {
+    var visible = visibleCategoryList();
+    var list = SUGGEST_CATEGORIES.map(function (c) {
+      var checked = visible.indexOf(c.label) !== -1 ? " checked" : "";
+      return '<label class="row" style="justify-content:flex-start;gap:8px"><input type="checkbox" data-cat="' + esc(c.label) + '"' + checked + '> ' + esc(c.label) + '</label>';
+    }).join("");
+    $("modalContent").innerHTML = '<h3>Choose your categories</h3>' +
+      '<p class="muted small">Only the ones you tick show up. The rest tuck away here until you want them back.</p>' +
+      list +
+      '<p id="catSaveNote" class="muted small"></p>' +
+      '<div class="row" style="margin-top:12px"><button id="catSaveBtn" class="btn-primary" type="button">Done</button></div>';
+    $("bookModal").classList.remove("hidden");
+    $("catSaveBtn").addEventListener("click", function () {
+      var checked = [];
+      $("modalContent").querySelectorAll("[data-cat]").forEach(function (box) {
+        if (box.checked) checked.push(box.getAttribute("data-cat"));
+      });
+      if (!checked.length) {
+        $("catSaveNote").textContent = "Pick at least one.";
+        return;
+      }
+      state.visibleCategories = checked;
+      lsSet("mbs_visible_categories", checked);
+      /* Drop any shake picks that are no longer showing. */
+      state.pickedCategories = state.pickedCategories.filter(function (l) { return checked.indexOf(l) !== -1; });
+      closeModal();
+      renderJar();
+    });
+  }
+
+  /* Titles that are just the search words themselves, like "Young Adult
+     Fantasy Fiction" turning up for a young-adult-fantasy search — a
+     label wearing a book's clothes, not a real pick. The check is tied
+     to the search that produced the record, so a real book that merely
+     has an ordinary title (say, "Adult Romance Book") is never caught. */
+  function isGenericTitle(title, queryWords) {
+    var allowed = {};
+    (queryWords || []).forEach(function (w) { allowed[w] = 1; });
+    allowed.fiction = 1; allowed.book = 1; allowed.books = 1;
+    var words = (title || "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter(function (w) { return !!w; });
+    return words.length > 0 && words.every(function (w) { return !!allowed[w]; });
+  }
+
+  async function suggestPick() {
+    var labels = state.pickedCategories.slice();
+    if (state.surprise || !labels.length) {
+      var all = visibleCategoryList();
+      if (!all.length) all = SUGGEST_CATEGORIES.map(function (c) { return c.label; });
+      labels = [all[Math.floor(Math.random() * all.length)]];
+    }
+    $("jarStatus").textContent = "Searching the catalogue for " + labels.join(", ") + "…";
+    var shelved = shelvedKeys();
+    var pool = [];
+    try {
+      var searches = await Promise.all(labels.map(function (label) {
+        var c = categoryByLabel(label);
+        return searchCatalogue(c ? c.query : label, 30).catch(function () { return []; });
+      }));
+      searches.forEach(function (results, si) {
+        var cat = categoryByLabel(labels[si]);
+        var queryWords = cat ? cat.query.split(/\s+/) : [];
+        results.forEach(function (r) {
+          var key = normKey(r.title, r.author);
+          if (shelved[key] || state.shownSuggestions[key]) return;
+
+          /* Skip label-as-title records: a real pick has a real name. */
+          if (isGenericTitle(r.title, queryWords)) return;
+          var hay = ((r.title || "") + " " + r.author + " " + (r.subjects || []).join(" ")).toLowerCase();
+          var matched = labels.filter(function (label) { return categoryMatches(hay, label); });
+          /* Every category must match. Nothing to guess, no fallbacks. */
+          if (matched.length !== labels.length) return;
+          pool.push({ book: r, matched: matched });
+        });
+      });
+    } catch (e) { /* fall through to the no-results message */ }
+    $("jarStatus").textContent = "";
+    if (!pool.length) {
+      $("jarResult").innerHTML = '<p class="muted">Nothing in the catalogue matched all of ' + esc(labels.join(", ")) +
+        ' that is not already on your shelves. Try different categories, or fewer of them at once.</p>';
+      return;
+    }
+    var pick = pool[Math.floor(Math.random() * pool.length)];
+    state.shownSuggestions[normKey(pick.book.title, pick.book.author)] = true;
+    var book = {
+      title: pick.book.title, author: pick.book.author, year: pick.book.year,
+      cover_url: coverUrl(pick.book.coverId, "L"), pages: pick.book.pages,
+      work_key: pick.book.workKey
+    };
+    showPick(book, "suggest", pick.matched, false);
+  }
+
+  /* Suggest-mode book search: she types her own words again, and this
+     time it searches real titles and authors instead of categories.
+     No year floor here on purpose: if she names the book, she gets
+     the book, whatever year it is. Books already on her shelves are
+     left out. */
+  async function runBookSearch() {
+    var q = $("bookSearchInput").value.trim();
+    if (!q) { $("bookSearchStatus").textContent = "Type a title or an author first."; return; }
+    $("bookSearchStatus").textContent = "Searching the catalogue…";
+    $("bookSearchResults").innerHTML = "";
+    try {
+      var results = await searchCatalogue(q, 20);
+      var shelved = shelvedKeys();
+      var ql = q.toLowerCase();
+      function searchScore(r) {
+        var t = (r.title || "").toLowerCase();
+        if (t === ql) return 0;
+        if (t.indexOf(ql) !== -1) return 1;
+        return 2;
+      }
+      results.sort(function (a, b) { return searchScore(a) - searchScore(b); });
+      var fresh = results.filter(function (r) { return !shelved[normKey(r.title, r.author)]; }).slice(0, 8);
+      if (!fresh.length) {
+        $("bookSearchStatus").textContent = results.length
+          ? "Everything found is already on your shelves."
+          : "Nothing found. Try another title or author, or add it by hand on the Home tab.";
+        return;
+      }
+      $("bookSearchStatus").textContent = "Tap Add to put one straight on your TBR shelf.";
+      $("bookSearchResults").innerHTML = fresh.map(function (r, i) {
+        return '<div class="result-row">' +
+          (r.coverId ? '<img src="' + coverUrl(r.coverId, "M") + '" alt="">' : "") +
+          '<div class="result-info"><strong>' + esc(r.title) + '</strong>' +
+          '<span>' + esc(r.author) + (r.year ? " · " + r.year : "") + (r.pages ? " · " + r.pages + " pages" : "") + '</span></div>' +
+          '<div class="result-actions"><button class="mini-btn" type="button" data-add="' + i + '">Add</button></div></div>';
+      }).join("");
+      $("bookSearchResults").querySelectorAll("[data-add]").forEach(function (btn) {
+        btn.addEventListener("click", async function () {
+          var r = fresh[parseInt(btn.getAttribute("data-add"), 10)];
+          var saved = await db.addBook({
+            title: r.title, author: r.author, year: r.year,
+            cover_url: coverUrl(r.coverId, "L"), pages: r.pages,
+            work_key: r.workKey, status: "tbr", tags: []
+          });
+          if (!saved) return;
+          btn.textContent = "Added ✓"; btn.disabled = true;
+          renderHome();
+        });
+      });
+    } catch (e) {
+      $("bookSearchStatus").textContent = "Search needs internet and did not go through. Check your connection and try again.";
+    }
+  }
+
+  function doShake() {
+    if (state.jarMode === "shelf" && !state.surprise && !state.pickedMoods.length) {
+      $("jarResult").innerHTML = '<p class="muted">Pick a mood first, or tap Surprise me — any mood, then shake the jar.</p>';
+      return;
+    }
+    if (state.jarMode === "suggest" && !state.surprise && !state.pickedCategories.length) {
+      $("jarResult").innerHTML = '<p class="muted">Pick a category first, or tap Surprise me — any category, then shake the jar.</p>';
+      return;
+    }
+    var jar = $("jarGraphic");
+    jar.classList.remove("shaking");
+    void jar.offsetWidth;
+    jar.classList.add("shaking");
+    $("jarResult").innerHTML = '<p class="muted">Shaking…</p>';
+    setTimeout(function () {
+      if (state.jarMode === "shelf") shelfPick(); else suggestPick();
+    }, 650);
+  }
+
+  /* ---------------- wiring ---------------- */
+
+  document.querySelectorAll(".tab-btn").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var p = btn.getAttribute("data-page");
+      showPage(p);
+      /* Re-split rows with the tab's real width now that it is visible. */
+      if (p === "home") renderHome();
+      if (p === "goal") renderGoal();
+    });
+  });
+  /* Re-split the rows if the width changes (e.g. rotating the phone). */
+  window.addEventListener("resize", function () {
+    var area = $("shelfArea");
+    if (area && state.books.length && $("page-home").classList.contains("active") && booksPerRow(area) !== lastPerRow) renderHome();
+    var gs = $("goalShelf");
+    if (gs && state.goal > 0 && $("page-goal").classList.contains("active") && goalPerRow(gs) !== lastGoalPerRow) renderGoal();
+  });
+  document.querySelectorAll(".shelf-tab").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      document.querySelectorAll(".shelf-tab").forEach(function (b) { b.classList.remove("active"); });
+      btn.classList.add("active");
+      state.homeShelf = btn.getAttribute("data-shelf");
+      renderHome();
+    });
+  });
+  /* Tags for a book added by hand: tap the shared choices, or type her
+     own. Kept in state until the book is added, then cleared. */
+  var manualTags = [];
+  function renderManualTags() {
+    var choicesEl = $("manualTagChoices"), pickedEl = $("manualTagPicked");
+    if (!choicesEl || !pickedEl) return;
+    var picked = manualTags.map(function (t) { return t.toLowerCase(); });
+    pickedEl.innerHTML = manualTags.map(function (t) {
+      return '<button class="chip selected" type="button" data-manual-untag="' + esc(t) + '">' + esc(t) + ' &times;</button>';
+    }).join("");
+    choicesEl.innerHTML = tagChoiceOptions().filter(function (t) { return picked.indexOf(t.toLowerCase()) === -1; }).map(function (t) {
+      return '<button class="chip" type="button" data-manual-tag="' + esc(t) + '">' + esc(t) + '</button>';
+    }).join("");
+    choicesEl.querySelectorAll("[data-manual-tag]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var v = btn.getAttribute("data-manual-tag").toLowerCase();
+        if (manualTags.indexOf(v) === -1) manualTags.push(v);
+        renderManualTags();
+      });
+    });
+    pickedEl.querySelectorAll("[data-manual-untag]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var v = btn.getAttribute("data-manual-untag");
+        manualTags = manualTags.filter(function (t) { return t !== v; });
+        renderManualTags();
+      });
+    });
+  }
+  $("addBookBtn").addEventListener("click", function () { $("addPanel").classList.toggle("hidden"); renderManualTags(); });
+  var manualTagAddBtn = $("manualTagAddBtn");
+  if (manualTagAddBtn) manualTagAddBtn.addEventListener("click", function () {
+    var v = $("manualTagInput").value.trim().toLowerCase();
+    if (!v) return;
+    if (manualTags.indexOf(v) === -1) manualTags.push(v);
+    $("manualTagInput").value = "";
+    renderManualTags();
+  });
+  /* Results as she types, so she never has to type the whole title and
+     then hit Search. Waits a beat after she stops typing, and only
+     starts once three letters are in. */
+  function wireLiveSearch(inputId, fn) {
+    var el = $(inputId);
+    if (!el) return;
+    var timer = null, last = "";
+    el.addEventListener("input", function () {
+      var q = el.value.trim();
+      clearTimeout(timer);
+      if (q.length < 3 || q === last) return;
+      timer = setTimeout(function () { last = el.value.trim(); fn(); }, 400);
+    });
+  }
+  $("searchBtn").addEventListener("click", runSearch);
+  $("searchInput").addEventListener("keydown", function (e) { if (e.key === "Enter") runSearch(); });
+  wireLiveSearch("searchInput", runSearch);
+  $("manualAddBtn").addEventListener("click", async function () {
+    var title = $("manualTitle").value.trim();
+    if (!title) { alert("Add a title first."); return; }
+    var saved = await db.addBook({
+      title: title, author: $("manualAuthor").value.trim() || "Unknown author",
+      year: parseInt($("manualYear").value, 10) || null,
+      pages: parseInt($("manualPages").value, 10) || null,
+      cover_url: manualCoverData || "", status: "tbr", tags: manualTags.slice(),
+      synopsis: $("manualSynopsis").value.trim()
+    });
+    if (!saved) return;
+    $("manualTitle").value = ""; $("manualAuthor").value = "";
+    $("manualYear").value = ""; $("manualPages").value = "";
+    $("manualCover").value = ""; manualCoverData = "";
+    $("manualSynopsis").value = ""; manualTags = []; renderManualTags();
+    $("manualCoverPreview").classList.add("hidden");
+    $("addPanel").classList.add("hidden");
+    renderAll();
+  });
+  $("modeShelfBtn").addEventListener("click", function () { state.jarMode = "shelf"; renderJar(); });
+  $("modeSuggestBtn").addEventListener("click", function () { state.jarMode = "suggest"; renderJar(); });
+  $("addMoodBtn").addEventListener("click", async function () {
+    var val = $("customMoodInput").value.trim();
+    if (!val) return;
+    await db.addMood(val);
+    if (state.pickedMoods.indexOf(val.toLowerCase()) === -1) state.pickedMoods.push(val.toLowerCase());
+    $("customMoodInput").value = "";
+    renderJar();
+  });
+  $("shakeBtn").addEventListener("click", doShake);
+  /* Suggest-mode book search box. Built once here, outside renderJar,
+     so chip taps never wipe what she typed. */
+  var bookSearchBox = document.createElement("div");
+  bookSearchBox.id = "bookSearchRow";
+  bookSearchBox.innerHTML = '<h3 style="margin-top:16px">Search for a book</h3>' +
+    '<p class="muted small">Type a title or an author and search it up directly. Results show as you type.</p>' +
+    '<div class="row"><input id="bookSearchInput" type="text" placeholder="Title or author…" style="flex:1">' +
+    '<button id="bookSearchBtn" class="btn-primary" type="button">Search</button></div>' +
+    '<p id="bookSearchStatus" class="muted small"></p>' +
+    '<div id="bookSearchResults"></div>';
+  $("shakeBtn").parentNode.insertBefore(bookSearchBox, $("shakeBtn"));
+  $("bookSearchBtn").addEventListener("click", runBookSearch);
+  $("bookSearchInput").addEventListener("keydown", function (e) { if (e.key === "Enter") runBookSearch(); });
+  wireLiveSearch("bookSearchInput", runBookSearch);
+  $("jarGraphic").addEventListener("click", doShake);
+  $("jarGraphic").addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") doShake(); });
+  $("goalSaveBtn").addEventListener("click", async function () {
+    var n = parseInt($("goalInput").value, 10);
+    if (isNaN(n) || n < 0) return;
+    await db.setGoal(n);
+    renderGoal();
+  });
+  $("sessionDate").value = todayStr();
+  $("sessionSaveBtn").addEventListener("click", async function () {
+    var pages = parseInt($("sessionPages").value, 10) || 0;
+    var chapters = parseInt($("sessionChapters").value, 10) || 0;
+    var minutes = parseInt($("sessionMinutes").value, 10) || 0;
+    if (!pages && !chapters && !minutes) { alert("Add pages, chapters, or minutes first."); return; }
+    var bookId = $("sessionBook").value || null;
+    var book = bookId ? state.books.find(function (b) { return b.id === bookId; }) : null;
+    await db.addSession({
+      book_id: bookId, book_title: book ? book.title : null,
+      pages: pages, chapters: chapters, minutes: minutes,
+      session_date: $("sessionDate").value || todayStr()
+    });
+    $("sessionPages").value = ""; $("sessionChapters").value = ""; $("sessionMinutes").value = "";
+    renderAll();
+  });
+  $("modalClose").addEventListener("click", closeModal);
+  $("bookModal").addEventListener("click", function (e) { if (e.target === $("bookModal")) closeModal(); });
+
+  /* ---------------- go ---------------- */
+
+  db.loadAll().then(function () { renderAll(); });
+})();
